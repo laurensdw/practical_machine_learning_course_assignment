@@ -1,0 +1,229 @@
+---
+title: "Weight Lift Prediction"
+author: "Laurens de Wit"
+date: "26 September 2018"
+output: 
+  html_document:
+    keep_md: yes
+  md_document:
+    variant: markdown_github
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.width=10, fig.height=5)
+options(width=120)
+
+library(lattice)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(randomForest)
+library(caret)
+library(Rmisc)
+library(ggplot2)
+library(corrplot)
+```
+
+## Goal
+
+The goal of this analysis is to predict what kind of exercise was performed based on the HAR dataset (http://groupware.les.inf.puc-rio.br/har). The dataset contains measurements of movement divided over 159 unique features.
+
+In order to reach this goal we will start by pre-processing the data, followed by an exploratory data analysis. Next, a model will be selected by analysing several different models with cross-validation, after which the results of our final model will be examed on test data. Finally, a conclusion will be drawn in which we answer the question that was posed in the formulation of our goal. 
+
+## Pre-processing
+
+First change 'am' to  factor (0 = automatic, 1 = manual)
+And make cylinders a factor as well (since it is not continious)
+
+```{r}
+training.raw <- read.csv("data/pml_training.csv")
+testing.raw <- read.csv("data/pml_testing.csv")
+```
+
+Obtain information about the dataset with the str function.
+```{r}
+str(training.raw)
+```
+
+
+As can be seen in the str output, there are a lot of missing values (NA) that will have to be dealt with. If more than twenty percent of the column contains missing values, the column will be removed.
+
+```{r}
+NAColumns <- which(colSums(is.na(training.raw) | training.raw=="") > nrow(training.raw) / 100 * 20)
+training <- training.raw[,-NAColumns]
+testing <- testing.raw[,-NAColumns]
+```
+
+As can also be seen some data points relate to time. These won't be needed for the prediction and thus can be removed.
+
+```{r}
+timeColumns <- grep("timestamp", names(training))
+training <- training[,-c(1, timeColumns )]
+testing <- testing[,-c(1, timeColumns )]
+```
+
+Finally, to further prepare data for analysis, all factor variables are converted to integers.
+```{r}
+depedentVarLevels <- levels(training$classe)
+training <- data.frame(data.matrix(training))
+training$classe <- factor(training$classe, labels=depedentVarLevels)
+testing <- data.frame(data.matrix(testing))
+```
+
+## Exploratory data analyses 
+
+In order to validate models the training data is further split to obtain a validation set.
+
+```{r}
+set.seed(12345)
+
+classeIndex <- which(names(training) == "classe")
+
+partition <- createDataPartition(y=training$classe, p=0.75, list=FALSE)
+training.t <- training[partition, ]
+training.v <- training[-partition, ]
+```
+
+Next, we'll check the correlations of the dependent variable (classe) with all the independent variables in the
+training data.
+
+```{r}
+correlations <- cor(training.t[, -classeIndex], as.numeric(training.t$classe))
+bestCorrelations <- subset(as.data.frame(as.table(correlations)), abs(Freq)>0.25)
+bestCorrelations
+```
+
+Only 4 predictors make it above the 0.25 cut-off point. Let's visualize these predictors:
+
+```{r}
+p1 <- ggplot(training.t, aes(classe,magnet_belt_y)) + 
+  geom_boxplot(aes(fill=classe))
+
+p2 <- ggplot(training.t, aes(classe, magnet_arm_x)) + 
+  geom_boxplot(aes(fill=classe))
+
+p3 <- ggplot(training.t, aes(classe,magnet_arm_y)) + 
+  geom_boxplot(aes(fill=classe))
+
+p4 <- ggplot(training.t, aes(classe, pitch_forearm)) + 
+  geom_boxplot(aes(fill=classe))
+
+
+
+multiplot(p1,p2,p3,p4,cols=2)
+```
+
+Judging from these visualization there is no obvious seperation between classes with just these four features.
+We'll have to try a couple more things.
+
+## Model selection 
+
+First we need to get rid of highly inter-correlated features:
+
+```{r}
+correlationMatrix <- cor(training.t[, -classeIndex])
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.9, exact=TRUE)
+excludeColumns <- c(highlyCorrelated, classeIndex)
+corrplot(correlationMatrix, method="color", type="lower", order="hclust", tl.cex=0.70, tl.col="black", tl.srt = 45, diag = FALSE)
+```
+
+As can be seen in the visualization above, some features are highly correlated. We'll run a PCA analysis on the full
+training dataset and on a training dataset that is filtered for the highly inter-correlated features. Next, we'll
+fit a predictive model to both datasets to see whether PCA is helpful.
+
+```{r}
+pcaPreProcess.all <- preProcess(training.t[, -classeIndex], method = "pca", thresh = 0.99)
+training.t.pca.all <- predict(pcaPreProcess.all, training.t[, -classeIndex])
+training.v.pca.all <- predict(pcaPreProcess.all, training.v[, -classeIndex])
+testing.pca.all <- predict(pcaPreProcess.all, testing[, -classeIndex])
+
+
+pcaPreProcess.subset <- preProcess(training.t[, -excludeColumns], method = "pca", thresh = 0.99)
+training.t.pca.subset <- predict(pcaPreProcess.subset, training.t[, -excludeColumns])
+training.v.pca.subset <- predict(pcaPreProcess.subset, training.v[, -excludeColumns])
+testing.pca.subset <- predict(pcaPreProcess.subset, testing[, -classeIndex])
+```
+
+Now that we have our PCA dataset we can fit a predictive model. We will go with the randomForest package. We will
+run a random forest on the 4 different ways we assembled our dataset:
+
+1. Our 'clean' dataset without further preprocessing.
+2. Our 'clean' dataset in which the highly intercorrelated predictors are 'excluded'.
+3. A PCA version of our 'clean' dataset without further preprocessing and thus containing 'all' features.
+4. A PCA version of our 'clean' dataset without the highly intercorrelated predictors and thus contaning
+a 'subset' of our dataset.
+
+```{r}
+
+ntree <- 100 
+
+rfMod.cleaned <- randomForest(
+  x=training.t[, -classeIndex], 
+  y=training.t$classe,
+  xtest=training.v[, -classeIndex], 
+  ytest=training.v$classe, 
+  ntree=ntree,
+  keep.forest=TRUE,
+  proximity=TRUE)
+
+rfMod.exclude <- randomForest(
+  x=training.t[, -excludeColumns], 
+  y=training.t$classe,
+  xtest=training.v[, -excludeColumns], 
+  ytest=training.v$classe, 
+  ntree=ntree,
+  keep.forest=TRUE,
+  proximity=TRUE) 
+
+rfMod.pca.all <- randomForest(
+  x=training.t.pca.all, 
+  y=training.t$classe,
+  xtest=training.v.pca.all, 
+  ytest=training.v$classe, 
+  ntree=ntree,
+  keep.forest=TRUE,
+  proximity=TRUE)
+
+rfMod.pca.subset <- randomForest(
+  x=training.t.pca.subset, 
+  y=training.t$classe,
+  xtest=training.v.pca.subset, 
+  ytest=training.v$classe, 
+  ntree=ntree,
+  keep.forest=TRUE,
+  proximity=TRUE)
+```
+
+## Model examination
+
+To examine the four models, their accuracy rates will be compared.
+
+* Note that the last model was too big for my CPU te handle. I still managed to get it running seperately but could not get it into the HTML, which is why I commented it. It's accuracy appeared to be worse than the other three models.
+
+```{r}
+paste0("Accuracy on training clean: ",1-mean(rfMod.cleaned$err.rate))
+paste0("Accuracy on testing clean: ",1-mean(rfMod.cleaned$test$err.rate))
+
+paste0("Accuracy on training excluded: ",1-mean(rfMod.exclude$err.rate))
+paste0("Accuracy on testing excluded: ",1-mean(rfMod.exclude$test$err.rate))
+
+paste0("Accuracy on training PCA all: ",1-mean(rfMod.pca.all$err.rate))
+paste0("Accuracy on testing PCA all: ",1-mean(rfMod.pca.all$test$err.rate))
+
+#paste0("Accuracy on training PCA subset: ",1-mean(rfMod.pca.subsetl$err.rate))
+#paste0("Accuracy on testing PCA subset: ",1-mean(rfMod.pca.subset$test$err.rate))
+```
+
+## Conclusion
+
+Based on the results above it can be concluded that the PCA did not improve our results. The exclude method seems to be a bit less accurate than the method in which we use all variables. However, as this difference is almsot negligble we'll stick we the exclude method as this method is computationally more efficiently.
+
+Now it's time to run our optimal model on the test data.
+
+# Test results
+
+
+```{r}
+predict(rfMod.exclude, testing[, -excludeColumns])
+```
